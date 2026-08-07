@@ -561,10 +561,24 @@ export class GameMonitor {
     // Record end time
     this.endTime = new Date().toISOString()
 
-    const mainWindow = BrowserWindow.getAllWindows()[0]
+    let showWindowAfterGameExit = false
+    try {
+      showWindowAfterGameExit = await ConfigDBManager.getConfigValue(
+        'general.showWindowAfterGameExit'
+      )
+    } catch (error) {
+      // 窗口恢复属于非关键体验；读取失败时保持关闭，不能阻断退出事件和时长保存。
+      log.warn('[Monitor] Failed to read the window behavior after game exit:', error)
+    }
 
-    mainWindow.show()
-    mainWindow.focus()
+    // 仅在用户显式开启时恢复并聚焦窗口，避免游戏退出打断当前操作。
+    if (showWindowAfterGameExit) {
+      const mainWindow = BrowserWindow.getAllWindows()[0]
+      if (mainWindow) {
+        mainWindow.show()
+        mainWindow.focus()
+      }
+    }
 
     ipcManager.send('game:exiting', this.options.gameId)
 

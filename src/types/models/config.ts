@@ -34,6 +34,7 @@ export interface configDocs {
     quitToTray: boolean
     language: string
     hideWindowAfterGameStart: boolean
+    showWindowAfterGameExit: boolean
     enableForegroundTimer: boolean
     foregroundWaitTime: number
     ignoreShortInterruptions: number
@@ -363,6 +364,8 @@ export const DEFAULT_CONFIG_VALUES: Readonly<configDocs> = {
     quitToTray: false,
     language: '',
     hideWindowAfterGameStart: true,
+    // 默认不在游戏退出时抢占焦点，避免打断用户正在进行的其他操作。
+    showWindowAfterGameExit: false,
     enableForegroundTimer: true,
     foregroundWaitTime: 10,
     ignoreShortInterruptions: 0,

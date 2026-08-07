@@ -128,6 +128,15 @@ export function General(): React.JSX.Element {
             controlType="switch"
           />
 
+          {/* 游戏退出后的窗口行为由用户显式决定，默认保持当前窗口状态。 */}
+          <ConfigItem
+            hookType="config"
+            path="general.showWindowAfterGameExit"
+            title={t('general.showWindowAfterGameExit')}
+            description={t('general.showWindowAfterGameExitDescription')}
+            controlType="switch"
+          />
+
           {/* Foreground Window Settings */}
           <div className={cn('space-y-4')}>
             <div className={cn('border-b pb-2')}>{t('general.timerTitle')}</div>
