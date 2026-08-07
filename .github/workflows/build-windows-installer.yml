@@ -1,0 +1,134 @@
+name: Build Windows installer
+
+# 临时构建分支推送后自动执行，同时保留手动重跑入口，便于复用同一提交定位问题。
+on:
+  push:
+    branches:
+      - build/windows-installer-game-exit-setting
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # 原生模块依赖 Win32 API，必须在 Windows 环境中编译后再交给 electron-builder 打包。
+    runs-on: windows-2025
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        # 跳过仓库的通用 postinstall；Windows 安装包不需要重复重建 Electron 依赖。
+        run: npm ci --ignore-scripts
+
+      - name: Apply dependency patches
+        run: npx patch-package
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          # 本次只生成测试安装包，不创建或更新 GitHub Release。
+          npm run build:win -- --publish never *>&1 | Tee-Object -FilePath build.log
+          $exitCode = $LASTEXITCODE
+          if ($exitCode -ne 0) {
+            # 将关键失败行写入公开检查注解，即使没有日志下载权限也能继续诊断。
+            $message = (Get-Content build.log -Tail 30) -join "%0A"
+            Write-Host "::error title=Windows installer build failed::$message"
+            exit $exitCode
+          }
+
+      - name: Verify packaged native module
+        shell: pwsh
+        run: |
+          # 使用安装包自带的 Electron/Node 运行时加载模块，直接验证 asar 路径和原生二进制。
+          $app = (Resolve-Path "dist/win-unpacked/Vnite.exe").Path
+          $asar = (Resolve-Path "dist/win-unpacked/resources/app.asar").Path
+          $module = "$asar/node_modules/vnite-native"
+          $env:ELECTRON_RUN_AS_NODE = "1"
+          & $app -e "require(process.argv[1]); console.log('PACKAGED_NATIVE_OK')" $module *>&1 |
+            Tee-Object -FilePath native-smoke.log
+          $exitCode = $LASTEXITCODE
+          Remove-Item Env:ELECTRON_RUN_AS_NODE
+          if ($exitCode -ne 0) {
+            $message = (Get-Content native-smoke.log -Tail 40) -join "%0A"
+            Write-Host "::error title=Packaged native module failed::$message"
+            exit $exitCode
+          }
+
+      - name: Smoke-test packaged app startup
+        shell: pwsh
+        run: |
+          # 启动解包程序并观察 20 秒；启动期退出或主进程异常都视为安装包不可用。
+          $app = (Resolve-Path "dist/win-unpacked/Vnite.exe").Path
+          $stdout = Join-Path $env:RUNNER_TEMP "vnite-stdout.log"
+          $stderr = Join-Path $env:RUNNER_TEMP "vnite-stderr.log"
+          $env:ELECTRON_ENABLE_LOGGING = "1"
+          $process = Start-Process -FilePath $app -ArgumentList "--enable-logging" `
+            -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          $exited = $process.WaitForExit(20000)
+          if (-not $exited) {
+            Stop-Process -Id $process.Id -Force
+          }
+          $diagnostic = @()
+          if (Test-Path $stdout) { $diagnostic += Get-Content $stdout -Tail 40 }
+          if (Test-Path $stderr) { $diagnostic += Get-Content $stderr -Tail 40 }
+          $message = ($diagnostic -join "%0A")
+          if ($exited -or $message -match "Cannot find module|A JavaScript error|Unhandled|TypeError|ReferenceError") {
+            Write-Host "::error title=Packaged app startup failed::$message"
+            exit 1
+          }
+          Write-Host "::notice title=Packaged app startup passed::Vnite remained running for 20 seconds"
+
+      - name: Install and smoke-test installer output
+        shell: pwsh
+        run: |
+          # 真实执行 NSIS 安装后再启动，区分解包产物问题和安装阶段引入的问题。
+          $installer = (Get-ChildItem "dist/*-setup.exe" | Select-Object -First 1).FullName
+          $installDir = Join-Path $env:RUNNER_TEMP "Vnite-installed"
+          $install = Start-Process -FilePath $installer -ArgumentList "/S", "/D=$installDir" `
+            -PassThru -Wait
+          if ($install.ExitCode -ne 0) {
+            Write-Host "::error title=Vnite installer failed::NSIS exited with code $($install.ExitCode)"
+            exit $install.ExitCode
+          }
+          $app = Join-Path $installDir "Vnite.exe"
+          if (-not (Test-Path $app)) {
+            Write-Host "::error title=Installed executable missing::$app was not created"
+            exit 1
+          }
+          $stdout = Join-Path $env:RUNNER_TEMP "vnite-installed-stdout.log"
+          $stderr = Join-Path $env:RUNNER_TEMP "vnite-installed-stderr.log"
+          $env:ELECTRON_ENABLE_LOGGING = "1"
+          $process = Start-Process -FilePath $app -ArgumentList "--enable-logging" `
+            -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          $exited = $process.WaitForExit(20000)
+          if (-not $exited) {
+            Stop-Process -Id $process.Id -Force
+          }
+          $diagnostic = @()
+          if (Test-Path $stdout) { $diagnostic += Get-Content $stdout -Tail 40 }
+          if (Test-Path $stderr) { $diagnostic += Get-Content $stderr -Tail 40 }
+          $message = ($diagnostic -join "%0A")
+          if ($exited -or $message -match "Cannot find module|A JavaScript error|Unhandled|TypeError|ReferenceError") {
+            Write-Host "::error title=Installed app startup failed::$message"
+            exit 1
+          }
+          Write-Host "::notice title=Installed app startup passed::Installed Vnite remained running for 20 seconds"
+
+      # 只上传最终安装程序，避免把解包目录和中间文件混入交付物。
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: vnite-windows-installer-${{ github.sha }}
+          path: dist/*.exe
+          if-no-files-found: error
+          retention-days: 7
