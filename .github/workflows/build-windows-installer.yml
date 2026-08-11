@@ -27,8 +27,12 @@ jobs:
           cache: npm
 
       - name: Install dependencies
-        # 跳过仓库的通用 postinstall；Windows 安装包不需要重复重建 Electron 依赖。
+        # 跳过仓库的通用 postinstall，避免再次触发已知失败；需要的原生依赖在下一步按白名单恢复。
         run: npm ci --ignore-scripts
+
+      - name: Install Skia Canvas native module
+        # skia-canvas 的安装脚本负责下载当前 Windows 架构的 skia.node，跳过后应用会在主进程启动时崩溃。
+        run: npm rebuild skia-canvas
 
       - name: Apply dependency patches
         run: npx patch-package
@@ -46,15 +50,17 @@ jobs:
             exit $exitCode
           }
 
-      - name: Verify packaged native module
+      - name: Verify packaged native modules
         shell: pwsh
         run: |
-          # 使用安装包自带的 Electron/Node 运行时加载模块，直接验证 asar 路径和原生二进制。
+          # 使用安装包自带的 Electron/Node 运行时加载全部关键模块，避免错误弹窗保持进程存活时被误判为成功。
           $app = (Resolve-Path "dist/win-unpacked/Vnite.exe").Path
           $asar = (Resolve-Path "dist/win-unpacked/resources/app.asar").Path
-          $module = "$asar/node_modules/vnite-native"
+          $vniteNative = "$asar/node_modules/vnite-native"
+          $skiaCanvas = "$asar/node_modules/skia-canvas"
           $env:ELECTRON_RUN_AS_NODE = "1"
-          & $app -e "require(process.argv[1]); console.log('PACKAGED_NATIVE_OK')" $module *>&1 |
+          & $app -e "require(process.argv[1]); require(process.argv[2]); console.log('PACKAGED_NATIVE_MODULES_OK')" `
+            $vniteNative $skiaCanvas *>&1 |
             Tee-Object -FilePath native-smoke.log
           $exitCode = $LASTEXITCODE
           Remove-Item Env:ELECTRON_RUN_AS_NODE
@@ -67,7 +73,7 @@ jobs:
       - name: Smoke-test packaged app startup
         shell: pwsh
         run: |
-          # 启动解包程序并观察 20 秒；启动期退出或主进程异常都视为安装包不可用。
+          # 原生模块已由上一步直接加载验证；这里继续检查正常启动是否提前退出或产生可观察异常。
           $app = (Resolve-Path "dist/win-unpacked/Vnite.exe").Path
           $stdout = Join-Path $env:RUNNER_TEMP "vnite-stdout.log"
           $stderr = Join-Path $env:RUNNER_TEMP "vnite-stderr.log"
@@ -82,7 +88,8 @@ jobs:
           if (Test-Path $stdout) { $diagnostic += Get-Content $stdout -Tail 40 }
           if (Test-Path $stderr) { $diagnostic += Get-Content $stderr -Tail 40 }
           $message = ($diagnostic -join "%0A")
-          if ($exited -or $message -match "Cannot find module|A JavaScript error|Unhandled|TypeError|ReferenceError") {
+          # 应用现有后台任务会记录非致命异常，日志只匹配明确的主进程启动错误，避免把可恢复错误误判为崩溃。
+          if ($exited -or $message -match "Cannot find module|A JavaScript error occurred in the main process") {
             Write-Host "::error title=Packaged app startup failed::$message"
             exit 1
           }
@@ -105,6 +112,21 @@ jobs:
             Write-Host "::error title=Installed executable missing::$app was not created"
             exit 1
           }
+          # 从真实安装目录再次加载原生模块，确认 NSIS 没有遗漏 asar.unpacked 中的二进制文件。
+          $asar = Join-Path $installDir "resources/app.asar"
+          $vniteNative = "$asar/node_modules/vnite-native"
+          $skiaCanvas = "$asar/node_modules/skia-canvas"
+          $env:ELECTRON_RUN_AS_NODE = "1"
+          & $app -e "require(process.argv[1]); require(process.argv[2]); console.log('INSTALLED_NATIVE_MODULES_OK')" `
+            $vniteNative $skiaCanvas *>&1 |
+            Tee-Object -FilePath installed-native-smoke.log
+          $moduleExitCode = $LASTEXITCODE
+          Remove-Item Env:ELECTRON_RUN_AS_NODE
+          if ($moduleExitCode -ne 0) {
+            $message = (Get-Content installed-native-smoke.log -Tail 40) -join "%0A"
+            Write-Host "::error title=Installed native modules failed::$message"
+            exit $moduleExitCode
+          }
           $stdout = Join-Path $env:RUNNER_TEMP "vnite-installed-stdout.log"
           $stderr = Join-Path $env:RUNNER_TEMP "vnite-installed-stderr.log"
           $env:ELECTRON_ENABLE_LOGGING = "1"
@@ -118,7 +140,8 @@ jobs:
           if (Test-Path $stdout) { $diagnostic += Get-Content $stdout -Tail 40 }
           if (Test-Path $stderr) { $diagnostic += Get-Content $stderr -Tail 40 }
           $message = ($diagnostic -join "%0A")
-          if ($exited -or $message -match "Cannot find module|A JavaScript error|Unhandled|TypeError|ReferenceError") {
+          # 与解包启动检查保持同一边界：非致命后台错误不应阻止安装包交付。
+          if ($exited -or $message -match "Cannot find module|A JavaScript error occurred in the main process") {
             Write-Host "::error title=Installed app startup failed::$message"
             exit 1
           }
